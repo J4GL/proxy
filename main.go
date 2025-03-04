@@ -10,212 +10,141 @@ import (
 	"os"
 )
 
-type Config struct {
-	Port int      `json:"port"`
-	IPv4 []string `json:"ipv4"`
-	IPv6 []string `json:"ipv6"`
-}
-
-func isIPAllowed(ip net.IP) bool {
-	data, err := os.ReadFile("config.json")
-	if err != nil {
-		debugLog("Failed to read allowed IPs: %v", err)
-		return false
-	}
-
-	var config Config
-	if err := json.Unmarshal(data, &config); err != nil {
-		debugLog("Failed to parse allowed IPs: %v", err)
-		return false
-	}
-
-	for _, cidr := range append(config.IPv4, config.IPv6...) {
-		_, ipnet, err := net.ParseCIDR(cidr)
-		if err != nil {
-			continue
-		}
-		if ipnet.Contains(ip) {
-			return true
-		}
-	}
-	return false
-}
-
-var debugMode bool
-
-func init() {
-	flag.BoolVar(&debugMode, "debug", false, "Enable debug mode with verbose logging")
-}
-
-func debugLog(format string, v ...interface{}) {
-	if debugMode {
-		log.Printf(format, v...)
-	}
-}
+var (
+	debugMode   bool
+	allowedNets []*net.IPNet
+)
 
 func main() {
+	flag.BoolVar(&debugMode, "debug", false, "Debug mode")
 	flag.Parse()
-
-	// Configure logging based on debug mode
 	if !debugMode {
 		log.SetOutput(io.Discard)
 	}
 
-	// Read configuration file
+	// Load config
 	data, err := os.ReadFile("config.json")
 	if err != nil {
-		log.Fatal("Failed to read config file:", err)
+		log.Fatal(err)
 	}
 
-	var config Config
-	if err := json.Unmarshal(data, &config); err != nil {
-		log.Fatal("Failed to parse config file:", err)
+	var cfg struct {
+		Port int      `json:"port"`
+		IPv4 []string `json:"ipv4"`
+		IPv6 []string `json:"ipv6"`
 	}
 
-	// Use default port if not specified
-	if config.Port == 0 {
-		config.Port = 1080
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		log.Fatal(err)
 	}
 
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", config.Port))
+	port := cfg.Port
+	if port == 0 {
+		port = 1080
+	}
+
+	// Parse networks once at startup
+	for _, cidr := range append(cfg.IPv4, cfg.IPv6...) {
+		if _, network, err := net.ParseCIDR(cidr); err == nil {
+			allowedNets = append(allowedNets, network)
+		}
+	}
+
+	// Start server
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
-		log.Fatal("Failed to start server:", err)
+		log.Fatal(err)
 	}
-	defer listener.Close()
 
-	// Always show the startup message
-	fmt.Printf("SOCKS5 proxy server listening on :%d\n", config.Port)
+	fmt.Printf("SOCKS5 on 127.0.0.1:%d\n", port)
 
 	for {
-		conn, err := listener.Accept()
+		clientConn, err := listener.Accept()
 		if err != nil {
-			log.Println("Failed to accept connection:", err)
 			continue
 		}
-		go handleConnection(conn)
+		go handle(clientConn)
 	}
 }
 
-func handleConnection(client net.Conn) {
-	defer client.Close()
+func handle(clientConn net.Conn) {
+	defer clientConn.Close()
 
-	// Check if client IP is allowed
-	ip := net.ParseIP(client.RemoteAddr().(*net.TCPAddr).IP.String())
-	if !isIPAllowed(ip) {
-		debugLog("Connection rejected from unauthorized IP: %s", ip)
+	// Check client IP
+	clientIP := clientConn.RemoteAddr().(*net.TCPAddr).IP
+	for _, network := range allowedNets {
+		if network.Contains(clientIP) {
+			goto allowed
+		}
+	}
+	if debugMode {
+		log.Printf("Blocked %s", clientIP)
+	}
+	return
+
+allowed:
+	// Auth phase
+	buffer := make([]byte, 4)
+	if _, err := io.ReadFull(clientConn, buffer[:2]); err != nil || buffer[0] != 0x05 || buffer[1] == 0 {
 		return
 	}
 
-	// Read the SOCKS5 version and number of authentication methods
-	buf := make([]byte, 2)
-	_, err := io.ReadFull(client, buf)
-	if err != nil {
-		debugLog("Failed to read SOCKS5 header: %v", err)
+	if _, err := io.ReadFull(clientConn, make([]byte, buffer[1])); err != nil {
 		return
 	}
 
-	// We only support SOCKS5 version and require at least one authentication method
-	if buf[0] != 0x05 || buf[1] == 0 {
-		debugLog("Unsupported SOCKS5 version or no authentication methods")
+	clientConn.Write([]byte{0x05, 0x00})
+
+	// Request phase
+	if _, err := io.ReadFull(clientConn, buffer[:4]); err != nil || buffer[1] != 0x01 {
 		return
 	}
 
-	// Read authentication methods
-	authMethods := make([]byte, int(buf[1]))
-	_, err = io.ReadFull(client, authMethods)
-	if err != nil {
-		debugLog("Failed to read authentication methods: %v", err)
-		return
-	}
-
-	// Respond with no authentication required
-	_, err = client.Write([]byte{0x05, 0x00})
-	if err != nil {
-		debugLog("Failed to send authentication response: %v", err)
-		return
-	}
-
-	// Read the SOCKS5 request
-	buf = make([]byte, 4)
-	_, err = io.ReadFull(client, buf)
-	if err != nil {
-		debugLog("Failed to read SOCKS5 request: %v", err)
-		return
-	}
-
-	// We only support CONNECT method (0x01)
-	if buf[1] != 0x01 {
-		debugLog("Unsupported SOCKS5 command")
-		return
-	}
-
-	// Read the destination address
-	var dstAddr string
-	switch buf[3] {
+	// Get destination
+	var hostName string
+	switch buffer[3] {
 	case 0x01: // IPv4
-		addr := make([]byte, 4)
-		_, err = io.ReadFull(client, addr)
-		if err != nil {
-			debugLog("Failed to read IPv4 address: %v", err)
+		ipBytes := make([]byte, 4)
+		if _, err := io.ReadFull(clientConn, ipBytes); err != nil {
 			return
 		}
-		dstAddr = net.IP(addr).String()
-	case 0x03: // Domain name
-		addrLen := make([]byte, 1)
-		_, err = io.ReadFull(client, addrLen)
-		if err != nil {
-			debugLog("Failed to read domain name length: %v", err)
+		hostName = net.IP(ipBytes).String()
+	case 0x03: // Domain
+		lengthByte := make([]byte, 1)
+		if _, err := io.ReadFull(clientConn, lengthByte); err != nil {
 			return
 		}
-		addr := make([]byte, addrLen[0])
-		_, err = io.ReadFull(client, addr)
-		if err != nil {
-			debugLog("Failed to read domain name: %v", err)
+		domainBytes := make([]byte, lengthByte[0])
+		if _, err := io.ReadFull(clientConn, domainBytes); err != nil {
 			return
 		}
-		dstAddr = string(addr)
+		hostName = string(domainBytes)
 	default:
-		debugLog("Unsupported address type")
 		return
 	}
 
-	// Read the destination port
-	port := make([]byte, 2)
-	_, err = io.ReadFull(client, port)
-	if err != nil {
-		debugLog("Failed to read destination port: %v", err)
+	// Get port
+	portBytes := make([]byte, 2)
+	if _, err := io.ReadFull(clientConn, portBytes); err != nil {
 		return
 	}
-	dstPort := int(port[0])<<8 | int(port[1])
+	destPort := int(portBytes[0])<<8 | int(portBytes[1])
 
-	// Connect to the destination
-	dstConn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", dstAddr, dstPort))
+	// Connect
+	targetConn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", hostName, destPort))
 	if err != nil {
-		debugLog("Failed to connect to destination: %v", err)
-		client.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		clientConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
-	defer dstConn.Close()
+	defer targetConn.Close()
 
-	// Send success response
-	_, err = client.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-	if err != nil {
-		debugLog("Failed to send success response: %v", err)
-		return
+	// Success
+	clientConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	if debugMode {
+		log.Printf("Connected to %s:%d", hostName, destPort)
 	}
 
-	debugLog("Client connected successfully to %s:%d", dstAddr, dstPort)
-
-	// Start proxying data
-	go func() {
-		_, err := io.Copy(dstConn, client)
-		if err != nil {
-			debugLog("Error while copying client to destination: %v", err)
-		}
-	}()
-
-	_, err = io.Copy(client, dstConn)
-	if err != nil {
-		debugLog("Error while copying destination to client: %v", err)
-	}
+	// Proxy data
+	go io.Copy(targetConn, clientConn)
+	io.Copy(clientConn, targetConn)
 }
