@@ -9,7 +9,6 @@ A lightweight and secure SOCKS5 proxy server implementation in Go with IP-based 
 - Support for both IPv4 and IPv6 addresses
 - Domain name resolution support
 - Debug mode for troubleshooting
-- No authentication required (designed for trusted networks)
 
 ## Installation
 
