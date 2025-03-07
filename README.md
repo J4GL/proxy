@@ -14,7 +14,7 @@ A lightweight, fast and secure SOCKS5 proxy server implementation in Go with IP-
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/proxy.git
+git clone https://github.com/J4GL/proxy.git
 cd proxy
 
 # Build the binary
