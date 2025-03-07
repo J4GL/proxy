@@ -1,6 +1,6 @@
 # SOCKS5 Proxy Server
 
-A lightweight and secure SOCKS5 proxy server implementation in Go with IP-based access control.
+A lightweight, fast and secure SOCKS5 proxy server implementation in Go with IP-based access control.
 
 ## Features
 
@@ -96,3 +96,9 @@ Run the test suite:
 ```bash
 go test
 ```
+
+## Speedtest
+
+On Macmini M4 with 10Gb ethernet and 8Gb internet.
+
+![alt text](sc.png "Title")
