@@ -8,53 +8,64 @@ import (
 	"log"
 	"net"
 	"os"
+	"sync"
 )
 
 var (
 	debugMode   bool
 	allowedNets []*net.IPNet
-)
-
-func main() {
-	flag.BoolVar(&debugMode, "debug", false, "Debug mode")
-	flag.Parse()
-	if !debugMode {
-		log.SetOutput(io.Discard)
-	}
-
-	// Load config
-	data, err := os.ReadFile("config.json")
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	var cfg struct {
+	config      struct {
 		Port int      `json:"port"`
 		IPv4 []string `json:"ipv4"`
 		IPv6 []string `json:"ipv6"`
 	}
+)
 
-	if err := json.Unmarshal(data, &cfg); err != nil {
+const (
+	defaultPort = 1080
+	socks5Ver   = 0x05
+	connectCmd  = 0x01
+	ipv4Type    = 0x01
+	domainType  = 0x03
+)
+
+func init() {
+	flag.BoolVar(&debugMode, "debug", false, "Debug mode")
+	flag.Parse()
+	
+	if !debugMode {
+		log.SetOutput(io.Discard)
+	}
+
+	// Load and parse config once
+	data, err := os.ReadFile("config.json")
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &config); err != nil {
 		log.Fatal(err)
 	}
 
-	port := cfg.Port
-	if port == 0 {
-		port = 1080
-	}
-
-	// Parse networks once at startup
-	for _, cidr := range append(cfg.IPv4, cfg.IPv6...) {
+	// Pre-allocate slice capacity
+	allowedNets = make([]*net.IPNet, 0, len(config.IPv4)+len(config.IPv6))
+	for _, cidr := range append(config.IPv4, config.IPv6...) {
 		if _, network, err := net.ParseCIDR(cidr); err == nil {
 			allowedNets = append(allowedNets, network)
 		}
 	}
+}
 
-	// Start server
+func main() {
+	port := config.Port
+	if port == 0 {
+		port = defaultPort
+	}
+
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer listener.Close()
 
 	fmt.Printf("SOCKS5 on 127.0.0.1:%d\n", port)
 
@@ -70,81 +81,127 @@ func main() {
 func handle(clientConn net.Conn) {
 	defer clientConn.Close()
 
+	// Buffer pool to reduce allocations
+	var bufPool sync.Pool
+	bufPool.New = func() interface{} {
+		return make([]byte, 256)
+	}
+
 	// Check client IP
 	clientIP := clientConn.RemoteAddr().(*net.TCPAddr).IP
-	for _, network := range allowedNets {
-		if network.Contains(clientIP) {
-			goto allowed
+	if !isAllowedIP(clientIP) {
+		if debugMode {
+			log.Printf("Blocked %s", clientIP)
 		}
+		return
 	}
-	if debugMode {
-		log.Printf("Blocked %s", clientIP)
-	}
-	return
 
-allowed:
 	// Auth phase
-	buffer := make([]byte, 4)
-	if _, err := io.ReadFull(clientConn, buffer[:2]); err != nil || buffer[0] != 0x05 || buffer[1] == 0 {
+	buf := bufPool.Get().([]byte)
+	defer bufPool.Put(buf)
+
+	if err := readAndVerify(clientConn, buf[:2], func(b []byte) bool {
+		return b[0] == socks5Ver && b[1] != 0
+	}); err != nil {
 		return
 	}
 
-	if _, err := io.ReadFull(clientConn, make([]byte, buffer[1])); err != nil {
+	if _, err := io.ReadFull(clientConn, buf[:buf[1]]); err != nil {
 		return
 	}
 
-	clientConn.Write([]byte{0x05, 0x00})
+	if _, err := clientConn.Write([]byte{socks5Ver, 0x00}); err != nil {
+		return
+	}
 
 	// Request phase
-	if _, err := io.ReadFull(clientConn, buffer[:4]); err != nil || buffer[1] != 0x01 {
+	if err := readAndVerify(clientConn, buf[:4], func(b []byte) bool {
+		return b[1] == connectCmd
+	}); err != nil {
 		return
 	}
 
 	// Get destination
-	var hostName string
-	switch buffer[3] {
-	case 0x01: // IPv4
-		ipBytes := make([]byte, 4)
-		if _, err := io.ReadFull(clientConn, ipBytes); err != nil {
-			return
-		}
-		hostName = net.IP(ipBytes).String()
-	case 0x03: // Domain
-		lengthByte := make([]byte, 1)
-		if _, err := io.ReadFull(clientConn, lengthByte); err != nil {
-			return
-		}
-		domainBytes := make([]byte, lengthByte[0])
-		if _, err := io.ReadFull(clientConn, domainBytes); err != nil {
-			return
-		}
-		hostName = string(domainBytes)
-	default:
+	hostName, err := parseDestination(clientConn, buf, buf[3])
+	if err != nil {
 		return
 	}
 
 	// Get port
-	portBytes := make([]byte, 2)
-	if _, err := io.ReadFull(clientConn, portBytes); err != nil {
+	if _, err := io.ReadFull(clientConn, buf[:2]); err != nil {
 		return
 	}
-	destPort := int(portBytes[0])<<8 | int(portBytes[1])
+	destPort := int(buf[0])<<8 | int(buf[1])
 
 	// Connect
-	targetConn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", hostName, destPort))
+	targetConn, err := net.Dial("tcp", net.JoinHostPort(hostName, fmt.Sprintf("%d", destPort)))
 	if err != nil {
-		clientConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		clientConn.Write([]byte{socks5Ver, 0x01, 0x00, ipv4Type, 0, 0, 0, 0, 0, 0})
 		return
 	}
 	defer targetConn.Close()
 
-	// Success
-	clientConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	// Success response
+	if _, err := clientConn.Write([]byte{socks5Ver, 0x00, 0x00, ipv4Type, 0, 0, 0, 0, 0, 0}); err != nil {
+		return
+	}
+
 	if debugMode {
 		log.Printf("Connected to %s:%d", hostName, destPort)
 	}
 
-	// Proxy data
-	go io.Copy(targetConn, clientConn)
-	io.Copy(clientConn, targetConn)
+	// Proxy data with wait group
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		io.Copy(targetConn, clientConn)
+		targetConn.Close()
+	}()
+	go func() {
+		defer wg.Done()
+		io.Copy(clientConn, targetConn)
+		clientConn.Close()
+	}()
+	wg.Wait()
+}
+
+func isAllowedIP(ip net.IP) bool {
+	for _, network := range allowedNets {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func readAndVerify(conn net.Conn, buf []byte, verify func([]byte) bool) error {
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return err
+	}
+	if !verify(buf) {
+		return fmt.Errorf("verification failed")
+	}
+	return nil
+}
+
+func parseDestination(conn net.Conn, buf []byte, addrType byte) (string, error) {
+	switch addrType {
+	case ipv4Type:
+		if _, err := io.ReadFull(conn, buf[:4]); err != nil {
+			return "", err
+		}
+		return net.IP(buf[:4]).String(), nil
+	case domainType:
+		if _, err := io.ReadFull(conn, buf[:1]); err != nil {
+			return "", err
+		}
+		length := buf[0]
+		if _, err := io.ReadFull(conn, buf[:length]); err != nil {
+			return "", err
+		}
+		return string(buf[:length]), nil
+	default:
+		return "", fmt.Errorf("unsupported address type")
+	}
 }
