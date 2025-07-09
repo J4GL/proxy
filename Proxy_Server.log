@@ -1,0 +1,20 @@
+2025/07/09 00:25:06 Loaded 3 allowed IPs from config
+2025/07/09 00:25:06 Proxy server listening on port 8080
+2025/07/09 00:25:06 Accepted new client from [::1]:51023
+2025/07/09 00:25:06 Client ::1 is authorized.
+2025/07/09 00:25:06 Accepted new client from [::1]:51025
+2025/07/09 00:25:06 Client ::1 is authorized.
+2025/07/09 00:25:06 Detected HTTP connection
+2025/07/09 00:25:06 Relaying data between client and localhost:8081
+2025/07/09 00:25:06 Accepted new client from [::1]:51027
+2025/07/09 00:25:06 Client ::1 is authorized.
+2025/07/09 00:25:06 Detected SOCKS5 connection
+2025/07/09 00:25:06 SOCKS5: Relaying data for [::1]:8081
+2025/07/09 00:25:06 Accepted new client from [::1]:51029
+2025/07/09 00:25:06 Client ::1 is authorized.
+2025/07/09 00:25:06 Detected HTTP connection
+2025/07/09 00:25:06 Relaying data between client and localhost:8081
+2025/07/09 00:25:08 Accepted new client from 127.0.0.1:51033
+2025/07/09 00:25:08 Client 127.0.0.1 is authorized.
+2025/07/09 00:25:08 Detected HTTP connection
+2025/07/09 00:25:08 Relaying data between client and mtalk.google.com:5228
