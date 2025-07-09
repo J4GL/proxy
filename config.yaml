@@ -1,0 +1,5 @@
+# Allowed IP addresses for proxy access
+allowed_ips:
+  - "127.0.0.1"
+  - "::1"
+  - "REMOVED_IP"
