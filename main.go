@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/binary"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -12,12 +13,16 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/gorilla/websocket"
 	"gopkg.in/yaml.v2"
 )
 
 const (
 	proxyPort     = "8080"
+	monitorPort   = "8082"
 	socks5Version = 0x05
 	noAuth        = 0x00
 	connectCmd    = 0x01
@@ -31,7 +36,39 @@ type Config struct {
 	AllowedIPs []string `yaml:"allowed_ips"`
 }
 
-var debugMode bool
+// ConnectionInfo holds information about an active connection
+type ConnectionInfo struct {
+	ID          string    `json:"id"`
+	ClientIP    string    `json:"client_ip"`
+	Protocol    string    `json:"protocol"`
+	Destination string    `json:"destination"`
+	StartTime   time.Time `json:"start_time"`
+	Duration    string    `json:"duration"`
+}
+
+// MonitoringStats holds overall statistics
+type MonitoringStats struct {
+	TotalConnections  int                        `json:"total_connections"`
+	ActiveConnections map[string]*ConnectionInfo `json:"active_connections"`
+	mutex             sync.RWMutex
+}
+
+// WebSocket upgrader
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true // Allow connections from any origin
+	},
+}
+
+var (
+	debugMode      bool
+	monitoringPort string
+	stats          = &MonitoringStats{
+		ActiveConnections: make(map[string]*ConnectionInfo),
+	}
+	wsClients = make(map[*websocket.Conn]bool)
+	wsMutex   sync.RWMutex
+)
 
 // loadConfig reads the YAML config file and returns a map of allowed IPs for quick lookup.
 func loadConfig(path string) (map[string]bool, error) {
@@ -54,6 +91,390 @@ func loadConfig(path string) (map[string]bool, error) {
 	return allowedIPs, nil
 }
 
+// addConnection registers a new connection in the monitoring system
+func addConnection(id, clientIP, protocol, destination string) {
+	stats.mutex.Lock()
+	conn := &ConnectionInfo{
+		ID:          id,
+		ClientIP:    clientIP,
+		Protocol:    protocol,
+		Destination: destination,
+		StartTime:   time.Now(),
+	}
+	stats.ActiveConnections[id] = conn
+	stats.TotalConnections++
+	stats.mutex.Unlock()
+
+	// Broadcast update to WebSocket clients (after releasing the mutex)
+	go broadcastUpdate()
+}
+
+// removeConnection removes a connection from the monitoring system
+func removeConnection(id string) {
+	stats.mutex.Lock()
+	delete(stats.ActiveConnections, id)
+	stats.mutex.Unlock()
+
+	// Broadcast update to WebSocket clients (after releasing the mutex)
+	go broadcastUpdate()
+}
+
+// getStats returns current statistics (thread-safe)
+func getStats() MonitoringStats {
+	stats.mutex.RLock()
+	defer stats.mutex.RUnlock()
+
+	// Update durations for active connections
+	result := MonitoringStats{
+		TotalConnections:  stats.TotalConnections,
+		ActiveConnections: make(map[string]*ConnectionInfo),
+	}
+
+	for id, conn := range stats.ActiveConnections {
+		connCopy := *conn
+		connCopy.Duration = time.Since(conn.StartTime).Round(time.Second).String()
+		result.ActiveConnections[id] = &connCopy
+	}
+
+	return result
+}
+
+// broadcastUpdate sends current stats to all WebSocket clients
+func broadcastUpdate() {
+	wsMutex.RLock()
+	defer wsMutex.RUnlock()
+
+	currentStats := getStats()
+	message, err := json.Marshal(currentStats)
+	if err != nil {
+		log.Printf("Error marshaling stats: %v", err)
+		return
+	}
+
+	for client := range wsClients {
+		err := client.WriteMessage(websocket.TextMessage, message)
+		if err != nil {
+			log.Printf("Error sending WebSocket message: %v", err)
+			client.Close()
+			delete(wsClients, client)
+		}
+	}
+}
+
+// handleWebSocket handles WebSocket connections for real-time updates
+func handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("WebSocket upgrade error: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	// Add client to the list
+	wsMutex.Lock()
+	wsClients[conn] = true
+	wsMutex.Unlock()
+
+	// Send initial data
+	currentStats := getStats()
+	message, err := json.Marshal(currentStats)
+	if err == nil {
+		conn.WriteMessage(websocket.TextMessage, message)
+	}
+
+	// Keep connection alive and handle disconnection
+	for {
+		_, _, err := conn.ReadMessage()
+		if err != nil {
+			wsMutex.Lock()
+			delete(wsClients, conn)
+			wsMutex.Unlock()
+			break
+		}
+	}
+}
+
+// handleAPI handles REST API requests for monitoring data
+func handleAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	currentStats := getStats()
+	json.NewEncoder(w).Encode(currentStats)
+}
+
+// handleDashboard serves the monitoring dashboard HTML
+func handleDashboard(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html")
+
+	html := `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Proxy Server Monitor</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        .stat-card {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+        .stat-number {
+            font-size: 2.5em;
+            font-weight: bold;
+            color: #667eea;
+            margin-bottom: 10px;
+        }
+        .stat-label {
+            color: #666;
+            font-size: 1.1em;
+        }
+        .connections-table {
+            background: white;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        .table-header {
+            background: #667eea;
+            color: white;
+            padding: 15px 20px;
+            font-size: 1.2em;
+            font-weight: bold;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th, td {
+            padding: 12px 15px;
+            text-align: left;
+            border-bottom: 1px solid #eee;
+        }
+        th {
+            background-color: #f8f9fa;
+            font-weight: 600;
+            color: #333;
+        }
+        tr:hover {
+            background-color: #f8f9fa;
+        }
+        .protocol-badge {
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 0.8em;
+            font-weight: bold;
+        }
+        .protocol-http {
+            background-color: #e3f2fd;
+            color: #1976d2;
+        }
+        .protocol-socks5 {
+            background-color: #f3e5f5;
+            color: #7b1fa2;
+        }
+        .status {
+            margin-top: 20px;
+            padding: 10px;
+            background: #e8f5e8;
+            border-left: 4px solid #4caf50;
+            border-radius: 4px;
+        }
+        .no-connections {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+            font-style: italic;
+        }
+        .last-updated {
+            text-align: center;
+            margin-top: 20px;
+            color: #666;
+            font-size: 0.9em;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🔍 Proxy Server Monitor</h1>
+            <p>Real-time monitoring dashboard for proxy connections</p>
+        </div>
+
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-number" id="total-connections">0</div>
+                <div class="stat-label">Total Connections</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number" id="active-connections">0</div>
+                <div class="stat-label">Active Connections</div>
+            </div>
+        </div>
+
+        <div class="connections-table">
+            <div class="table-header">Active Connections</div>
+            <div id="connections-content">
+                <div class="no-connections">No active connections</div>
+            </div>
+        </div>
+
+        <div class="status" id="connection-status">
+            🟢 Connected to monitoring server
+        </div>
+
+        <div class="last-updated" id="last-updated">
+            Last updated: Never
+        </div>
+    </div>
+
+    <script>
+        let ws;
+        let reconnectInterval;
+
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = protocol + '//' + window.location.host + '/ws';
+
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = function() {
+                console.log('WebSocket connected');
+                document.getElementById('connection-status').innerHTML = '🟢 Connected to monitoring server';
+                document.getElementById('connection-status').style.background = '#e8f5e8';
+                document.getElementById('connection-status').style.borderColor = '#4caf50';
+                if (reconnectInterval) {
+                    clearInterval(reconnectInterval);
+                    reconnectInterval = null;
+                }
+            };
+
+            ws.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                updateDashboard(data);
+            };
+
+            ws.onclose = function() {
+                console.log('WebSocket disconnected');
+                document.getElementById('connection-status').innerHTML = '🔴 Disconnected from monitoring server';
+                document.getElementById('connection-status').style.background = '#ffebee';
+                document.getElementById('connection-status').style.borderColor = '#f44336';
+
+                // Attempt to reconnect every 5 seconds
+                if (!reconnectInterval) {
+                    reconnectInterval = setInterval(connectWebSocket, 5000);
+                }
+            };
+
+            ws.onerror = function(error) {
+                console.error('WebSocket error:', error);
+            };
+        }
+
+        function updateDashboard(data) {
+            document.getElementById('total-connections').textContent = data.total_connections || 0;
+            document.getElementById('active-connections').textContent = Object.keys(data.active_connections || {}).length;
+
+            const connectionsContent = document.getElementById('connections-content');
+            const connections = data.active_connections || {};
+
+            if (Object.keys(connections).length === 0) {
+                connectionsContent.innerHTML = '<div class="no-connections">No active connections</div>';
+            } else {
+                let tableHTML = '<table><thead><tr><th>Client IP</th><th>Protocol</th><th>Destination</th><th>Duration</th><th>Start Time</th></tr></thead><tbody>';
+
+                Object.values(connections).forEach(conn => {
+                    const protocolClass = conn.protocol.toLowerCase() === 'http' ? 'protocol-http' : 'protocol-socks5';
+                    const startTime = new Date(conn.start_time).toLocaleString();
+
+                    tableHTML += '<tr>' +
+                        '<td>' + conn.client_ip + '</td>' +
+                        '<td><span class="protocol-badge ' + protocolClass + '">' + conn.protocol + '</span></td>' +
+                        '<td>' + conn.destination + '</td>' +
+                        '<td>' + conn.duration + '</td>' +
+                        '<td>' + startTime + '</td>' +
+                        '</tr>';
+                });
+
+                tableHTML += '</tbody></table>';
+                connectionsContent.innerHTML = tableHTML;
+            }
+
+            document.getElementById('last-updated').textContent = 'Last updated: ' + new Date().toLocaleString();
+        }
+
+        // Initialize WebSocket connection
+        connectWebSocket();
+
+        // Fallback: fetch data every 30 seconds if WebSocket fails
+        setInterval(function() {
+            if (ws.readyState !== WebSocket.OPEN) {
+                fetch('/api/stats')
+                    .then(response => response.json())
+                    .then(data => updateDashboard(data))
+                    .catch(error => console.error('Error fetching data:', error));
+            }
+        }, 30000);
+    </script>
+</body>
+</html>`
+
+	fmt.Fprint(w, html)
+}
+
+// startMonitoringServer starts the web monitoring server
+func startMonitoringServer(port string) {
+	// Create a new ServeMux to avoid conflicts with default handlers
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", handleDashboard)
+	mux.HandleFunc("/ws", handleWebSocket)
+	mux.HandleFunc("/api/stats", handleAPI)
+
+	log.Printf("Starting monitoring server on port %s", port)
+	log.Printf("Dashboard available at: http://localhost:%s", port)
+
+	server := &http.Server{
+		Addr:    ":" + port,
+		Handler: mux,
+	}
+
+	if err := server.ListenAndServe(); err != nil {
+		log.Printf("Monitoring server error: %v", err)
+		log.Printf("Monitoring dashboard will not be available")
+	}
+}
+
+// generateConnectionID creates a unique connection ID
+func generateConnectionID() string {
+	return fmt.Sprintf("conn_%d_%d", time.Now().UnixNano(), len(stats.ActiveConnections))
+}
+
 // isPortAvailable checks if a TCP port is available.
 func isPortAvailable(port string) bool {
 	ln, err := net.Listen("tcp", ":"+port)
@@ -67,16 +488,27 @@ func isPortAvailable(port string) bool {
 func main() {
 	flag.BoolVar(&debugMode, "debug", false, "Enable debug logging for connections")
 	flag.BoolVar(&debugMode, "d", false, "Enable debug logging for connections (shorthand)")
+	flag.StringVar(&monitoringPort, "monitor-port", monitorPort, "Port for the monitoring web interface")
+	flag.StringVar(&monitoringPort, "m", monitorPort, "Port for the monitoring web interface (shorthand)")
 	flag.Parse()
 
+	// Check if proxy port is available
 	if !isPortAvailable(proxyPort) {
 		log.Fatalf("Port %s is already in use.", proxyPort)
+	}
+
+	// Check if monitoring port is available
+	if !isPortAvailable(monitoringPort) {
+		log.Fatalf("Monitoring port %s is already in use.", monitoringPort)
 	}
 
 	allowedIPs, err := loadConfig("config.yaml")
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
+
+	// Start monitoring server in a separate goroutine
+	go startMonitoringServer(monitoringPort)
 
 	listener, err := net.Listen("tcp", ":"+proxyPort)
 	if err != nil {
@@ -120,6 +552,9 @@ func handleConnection(conn net.Conn, allowedIPs map[string]bool, debug bool) {
 		log.Printf("Client %s is authorized.", clientIP)
 	}
 
+	// Generate unique connection ID
+	connID := generateConnectionID()
+
 	reader := bufio.NewReader(conn)
 	firstByte, err := reader.Peek(1)
 	if err != nil {
@@ -130,16 +565,16 @@ func handleConnection(conn net.Conn, allowedIPs map[string]bool, debug bool) {
 		if debug {
 			log.Println("Detected SOCKS5 connection")
 		}
-		handleSocks5(conn, reader, debug)
+		handleSocks5(conn, reader, debug, connID, clientIP)
 	} else {
 		if debug {
 			log.Println("Detected HTTP connection")
 		}
-		handleHTTP(conn, reader, debug)
+		handleHTTP(conn, reader, debug, connID, clientIP)
 	}
 }
 
-func handleHTTP(clientConn net.Conn, reader *bufio.Reader, debug bool) {
+func handleHTTP(clientConn net.Conn, reader *bufio.Reader, debug bool, connID, clientIP string) {
 	req, err := http.ReadRequest(reader)
 	if err != nil {
 		if debug {
@@ -152,6 +587,10 @@ func handleHTTP(clientConn net.Conn, reader *bufio.Reader, debug bool) {
 	if _, _, err := net.SplitHostPort(address); err != nil {
 		address = net.JoinHostPort(address, "80")
 	}
+
+	// Register connection in monitoring system
+	addConnection(connID, clientIP, "HTTP", address)
+	defer removeConnection(connID)
 
 	serverConn, err := net.Dial("tcp", address)
 	if err != nil {
@@ -188,7 +627,7 @@ func handleHTTP(clientConn net.Conn, reader *bufio.Reader, debug bool) {
 	io.Copy(clientConn, serverConn)
 }
 
-func handleSocks5(clientConn net.Conn, reader *bufio.Reader, debug bool) {
+func handleSocks5(clientConn net.Conn, reader *bufio.Reader, debug bool, connID, clientIP string) {
 	header := make([]byte, 2)
 	if _, err := io.ReadFull(reader, header); err != nil {
 		if debug {
@@ -285,6 +724,10 @@ func handleSocks5(clientConn net.Conn, reader *bufio.Reader, debug bool) {
 	}
 	port := binary.BigEndian.Uint16(portBytes)
 	address := net.JoinHostPort(host, strconv.Itoa(int(port)))
+
+	// Register connection in monitoring system
+	addConnection(connID, clientIP, "SOCKS5", address)
+	defer removeConnection(connID)
 
 	destConn, err := net.Dial("tcp", address)
 	if err != nil {
