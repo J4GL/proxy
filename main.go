@@ -66,8 +66,9 @@ var (
 	stats          = &MonitoringStats{
 		ActiveConnections: make(map[string]*ConnectionInfo),
 	}
-	wsClients = make(map[*websocket.Conn]bool)
-	wsMutex   sync.RWMutex
+	wsClients     = make(map[*websocket.Conn]bool)
+	wsMutex       sync.RWMutex
+	broadcastChan = make(chan struct{}, 100) // Buffered channel to prevent blocking
 )
 
 // loadConfig reads the YAML config file and returns a map of allowed IPs for quick lookup.
@@ -105,8 +106,12 @@ func addConnection(id, clientIP, protocol, destination string) {
 	stats.TotalConnections++
 	stats.mutex.Unlock()
 
-	// Broadcast update to WebSocket clients (after releasing the mutex)
-	go broadcastUpdate()
+	// Signal broadcast update (non-blocking)
+	select {
+	case broadcastChan <- struct{}{}:
+	default:
+		// Channel is full, skip this update to prevent blocking
+	}
 }
 
 // removeConnection removes a connection from the monitoring system
@@ -115,8 +120,12 @@ func removeConnection(id string) {
 	delete(stats.ActiveConnections, id)
 	stats.mutex.Unlock()
 
-	// Broadcast update to WebSocket clients (after releasing the mutex)
-	go broadcastUpdate()
+	// Signal broadcast update (non-blocking)
+	select {
+	case broadcastChan <- struct{}{}:
+	default:
+		// Channel is full, skip this update to prevent blocking
+	}
 }
 
 // getStats returns current statistics (thread-safe)
@@ -141,9 +150,6 @@ func getStats() MonitoringStats {
 
 // broadcastUpdate sends current stats to all WebSocket clients
 func broadcastUpdate() {
-	wsMutex.RLock()
-	defer wsMutex.RUnlock()
-
 	currentStats := getStats()
 	message, err := json.Marshal(currentStats)
 	if err != nil {
@@ -151,7 +157,17 @@ func broadcastUpdate() {
 		return
 	}
 
+	wsMutex.Lock()
+	defer wsMutex.Unlock()
+
+	// Create a list of clients to avoid holding the lock during writes
+	clients := make([]*websocket.Conn, 0, len(wsClients))
 	for client := range wsClients {
+		clients = append(clients, client)
+	}
+
+	// Write to each client sequentially to avoid concurrent writes
+	for _, client := range clients {
 		err := client.WriteMessage(websocket.TextMessage, message)
 		if err != nil {
 			log.Printf("Error sending WebSocket message: %v", err)
@@ -338,6 +354,10 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
             </div>
         </div>
 
+        <div class="status" id="connection-status">
+            🟢 Connected to monitoring server
+        </div>
+
         <div class="connections-table">
             <div class="table-header">Active Connections</div>
             <div id="connections-content">
@@ -345,9 +365,7 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
             </div>
         </div>
 
-        <div class="status" id="connection-status">
-            🟢 Connected to monitoring server
-        </div>
+
 
         <div class="last-updated" id="last-updated">
             Last updated: Never
@@ -470,6 +488,28 @@ func startMonitoringServer(port string) {
 	}
 }
 
+// startBroadcastWorker starts a goroutine that handles WebSocket broadcasts sequentially
+func startBroadcastWorker() {
+	go func() {
+		for range broadcastChan {
+			broadcastUpdate()
+			// Add a small delay to batch rapid updates
+			time.Sleep(100 * time.Millisecond)
+
+			// Drain any additional signals that came in during the delay
+		drainLoop:
+			for {
+				select {
+				case <-broadcastChan:
+					// Drain additional signals
+				default:
+					break drainLoop
+				}
+			}
+		}
+	}()
+}
+
 // generateConnectionID creates a unique connection ID
 func generateConnectionID() string {
 	return fmt.Sprintf("conn_%d_%d", time.Now().UnixNano(), len(stats.ActiveConnections))
@@ -506,6 +546,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
+
+	// Start broadcast worker for WebSocket updates
+	startBroadcastWorker()
 
 	// Start monitoring server in a separate goroutine
 	go startMonitoringServer(monitoringPort)

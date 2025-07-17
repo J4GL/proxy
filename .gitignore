@@ -1,0 +1,6 @@
+proxy_app
+proxy-server
+test_server_app
+
+# Log files
+*.log

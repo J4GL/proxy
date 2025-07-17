@@ -1,109 +1,232 @@
-# Go Multi-Protocol Proxy Server
+# Multi-Protocol Proxy Server
 
-This project implements a multi-protocol proxy server in Go that can handle both HTTP/HTTPS and SOCKS5 connections on a single port. It's designed to be lightweight and efficient.
+A high-performance Go proxy server that handles both HTTP/HTTPS and SOCKS5 protocols on a single port with real-time monitoring capabilities.
 
-## How It Works
+## Features
 
-The proxy server listens for TCP connections on a single port (`8080` by default). When a new client connects, the server employs a protocol sniffing technique to determine whether the incoming request is for HTTP or SOCKS5.
+- **Dual Protocol Support**: Automatically detects and handles both HTTP/HTTPS and SOCKS5 connections
+- **Real-time Monitoring**: Web dashboard with live connection tracking via WebSocket
+- **IP-based Access Control**: Configurable whitelist for authorized clients
+- **Protocol Sniffing**: Intelligent detection of connection type without separate ports
+- **Comprehensive Logging**: Debug mode with detailed connection information
 
-1.  **Protocol Sniffing**: The server reads the very first byte of the incoming data stream without consuming it.
-    *   If the first byte is `0x05`, it signifies the start of a SOCKS5 protocol handshake.
-    *   For any other byte, the connection is assumed to be an HTTP request.
-
-2.  **HTTP/HTTPS Handling (`handleHttp`)**:
-    *   If the request is identified as HTTP, the server reads the full request using Go's standard `net/http` package.
-    *   **For HTTPS (`CONNECT` method)**: When a client sends a `CONNECT` request, the proxy establishes a direct TCP tunnel. It connects to the destination server requested by the client, sends a `200 OK` response back to the client, and then blindly relays TCP data in both directions. This allows for secure end-to-end TLS communication.
-    *   **For HTTP (e.g., `GET`, `POST`)**: The proxy parses the request, connects to the destination host, forwards the client's request, and then relays the server's response back to the client.
-
-3.  **SOCKS5 Handling (`handleSocks5`)**:
-    *   **Handshake**: The server performs the SOCKS5 handshake. It currently supports the "No Authentication Required" method (`0x00`).
-    *   **Request**: It reads the client's request, which specifies the command (only `CONNECT` is supported) and the destination address (which can be an IPv4, IPv6, or domain name).
-    *   **Connection**: The proxy connects to the requested destination address and port.
-    *   **Relay**: If the connection is successful, it sends a success reply to the client and then begins relaying TCP data back and forth between the client and the destination server.
-
-## How to Run
+## Quick Start
 
 ### Prerequisites
 
-*   Go (version 1.18 or later)
-*   `curl` and `wget` for testing
+- Go 1.18 or later
+- Basic networking tools (curl, wget) for testing
 
-### 1. Build the Applications
+### Installation
 
-First, compile the proxy server and the accompanying test server. Run these commands from the project's root directory:
-
+1. Clone the repository:
 ```bash
-# Build the proxy server
-go build -o proxy_app main.go
+git clone <repository-url>
+cd proxy
+```
 
-# Build the test server
+2. Build the applications:
+```bash
+go build -o proxy_app main.go
 go build -o test_server/test_server_app test_server/main.go
 ```
 
-### 2. Run the Servers
+### Basic Usage
 
-You need to run two applications in separate terminal windows: the test server and the proxy server.
-
-**Terminal 1: Start the Test Server**
-
-The test server is a simple file server that serves the content of `test.txt` on port `8081`.
-
+1. **Start the proxy server:**
 ```bash
-# Navigate to the test_server directory
-cd test_server
-
-# Run the test server
-./test_server_app
-```
-You should see a log message indicating the server is running and serving files from the current directory.
-
-**Terminal 2: Start the Proxy Server**
-
-The proxy server will listen on port `8080`.
-
-```bash
-# From the project root directory
 ./proxy_app
 ```
-You will see a log message that the proxy is listening on port 8080.
 
-### 3. Test the Proxy
-
-You can now use `curl` and `wget` to make requests through the proxy to the test server.
-
-**Test 1: curl with HTTP Proxy**
-
+2. **Start the test server** (in another terminal):
 ```bash
-curl --proxy http://localhost:8080 http://localhost:8081/test.txt
+cd test_server && ./test_server_app
 ```
 
-**Test 2: curl with SOCKS5 Proxy**
-
+3. **Test the proxy:**
 ```bash
+# HTTP proxy
+curl --proxy http://localhost:8080 http://localhost:8081/test.txt
+
+# SOCKS5 proxy
 curl --proxy socks5://localhost:8080 http://localhost:8081/test.txt
 ```
 
-**Test 3: wget with HTTP Proxy**
+## Configuration
 
-```bash
-wget -e "http_proxy=http://localhost:8080" http://localhost:8081/test.txt -O -
+### Access Control
+
+Edit `config.yaml` to configure allowed IP addresses:
+
+```yaml
+allowed_ips:
+  - "127.0.0.1"
+  - "::1"
+  - "your.ip.address.here"
 ```
 
-**Test 4: wget with SOCKS5 Proxy**
-
-Note: `wget` uses the `all_proxy` environment variable for SOCKS support.
+### Command Line Options
 
 ```bash
-all_proxy=socks5://localhost:8080 wget http://localhost:8081/test.txt -O -
+./proxy_app [OPTIONS]
+
+Options:
+  -debug, -d              Enable debug logging
+  -monitor-port, -m PORT  Set monitoring dashboard port (default: 8082)
 ```
 
-In all cases, the expected output is the content of the `test.txt` file:
-`Bonjour, ceci est un test de téléchargement.`
+## Monitoring Dashboard
 
-## Project Files
+The proxy server includes a comprehensive real-time monitoring interface that provides visibility into all proxy connections.
 
-*   `main.go`: The source code for the main proxy server application.
-*   `test_server/main.go`: The source code for the simple HTTP test server.
-*   `test_server/test.txt`: A simple text file used for testing downloads through the proxy.
-*   `plan.md`: The development and testing plan followed to create this project.
-*   `README.md`: This file.
+### Web Interface
+
+Access the monitoring dashboard at `http://localhost:8082` (or your configured monitoring port):
+
+**Features:**
+- **Real-time Connection Tracking**: View all active connections with live updates
+- **Connection Statistics**: Total connections processed since startup
+- **Protocol Breakdown**: See HTTP vs SOCKS5 connection distribution
+- **Client Information**: Monitor client IP addresses and connection patterns
+- **Connection Duration**: Track how long connections remain active
+- **Destination Mapping**: View what destinations clients are accessing
+
+**Dashboard Elements:**
+- Statistics cards showing total and active connection counts
+- Live connection table with client IP, protocol, destination, and duration
+- Real-time updates via WebSocket (no page refresh needed)
+- Connection status indicators and timestamps
+- Clean, responsive interface that works on desktop and mobile
+
+### API Endpoints
+
+The monitoring system provides both web interface and programmatic access:
+
+- `GET /` - Interactive web dashboard
+- `GET /api/stats` - JSON statistics for integration with external tools
+- `WebSocket /ws` - Real-time updates stream for custom applications
+
+### Monitoring Configuration
+
+The monitoring server runs on a separate port (default 8082) and can be configured:
+
+```bash
+# Custom monitoring port
+./proxy_app -monitor-port 9090
+
+# Access dashboard at http://localhost:9090
+```
+
+## Testing
+
+### Automated Testing
+
+Run the comprehensive test suite:
+
+```bash
+./test.sh
+```
+
+This script automatically:
+- Builds the applications if needed
+- Starts both servers
+- Runs tests for HTTP and SOCKS5 protocols
+- Cleans up processes after testing
+
+### Manual Testing
+
+Test HTTP proxy:
+```bash
+curl --proxy http://localhost:8080 https://httpbin.org/ip
+wget -e "http_proxy=http://localhost:8080" https://httpbin.org/ip -O -
+```
+
+Test SOCKS5 proxy:
+```bash
+curl --proxy socks5://localhost:8080 https://httpbin.org/ip
+all_proxy=socks5://localhost:8080 wget https://httpbin.org/ip -O -
+```
+
+### Go Tests
+
+Run monitoring system tests:
+```bash
+go test -v -run TestMonitoring
+```
+
+## Architecture
+
+### Protocol Detection
+
+The server uses protocol sniffing to handle multiple protocols on a single port:
+- SOCKS5 connections start with byte `0x05`
+- All other connections are treated as HTTP
+
+### Core Components
+
+- **Connection Handler**: Manages incoming connections and protocol detection
+- **HTTP Handler**: Processes HTTP/HTTPS requests with CONNECT method support
+- **SOCKS5 Handler**: Implements full SOCKS5 protocol with authentication
+- **Monitoring System**: Thread-safe connection tracking with WebSocket broadcasting
+
+### Security Features
+
+- IP-based access control
+- No authentication bypass vulnerabilities
+- Secure connection handling with proper cleanup
+- Debug logging for security auditing
+
+## Development
+
+### Project Structure
+
+```
+├── main.go              # Main proxy server
+├── config.yaml          # IP whitelist configuration
+├── test_server/         # Test HTTP server
+│   ├── main.go         # Test server implementation
+│   └── test.txt        # Test file
+├── monitoring_test.go   # Monitoring system tests
+├── test.sh             # Automated test suite
+└── CLAUDE.md           # Development guide
+```
+
+### Key Functions
+
+- `handleConnection()` - Main connection processing
+- `handleHTTP()` - HTTP/HTTPS proxy logic
+- `handleSocks5()` - SOCKS5 implementation
+- `addConnection()` - Connection tracking
+- `broadcastUpdate()` - Real-time monitoring updates
+
+## Dependencies
+
+- `github.com/gorilla/websocket` - WebSocket support
+- `gopkg.in/yaml.v2` - YAML configuration parsing
+- Standard Go libraries for networking
+
+## Troubleshooting
+
+### Common Issues
+
+1. **Port already in use**: Check if other services are using ports 8080, 8081, or 8082
+2. **Connection refused**: Verify IP address is in the whitelist
+3. **Monitoring not working**: Ensure WebSocket connections are not blocked
+
+### Debug Mode
+
+Enable debug logging to troubleshoot connection issues:
+
+```bash
+./proxy_app -debug
+```
+
+This provides detailed information about:
+- Client connection attempts
+- Protocol detection results
+- Connection establishment status
+- Data relay operations
+
+## License
+
+This project is provided as-is for educational and development purposes.
