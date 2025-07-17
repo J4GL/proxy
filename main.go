@@ -42,6 +42,7 @@ type ConnectionInfo struct {
 	ClientIP    string    `json:"client_ip"`
 	Protocol    string    `json:"protocol"`
 	Destination string    `json:"destination"`
+	DomainName  string    `json:"domain_name"`
 	StartTime   time.Time `json:"start_time"`
 	Duration    string    `json:"duration"`
 }
@@ -92,14 +93,49 @@ func loadConfig(path string) (map[string]bool, error) {
 	return allowedIPs, nil
 }
 
+// reverseDNSLookup attempts to resolve an IP address to a domain name
+func reverseDNSLookup(destination string) string {
+	// Parse the destination to extract just the IP if it contains a port
+	host, _, err := net.SplitHostPort(destination)
+	if err != nil {
+		// If SplitHostPort fails, assume destination is just a host
+		host = destination
+	}
+
+	// Check if the host is already a domain name (contains letters)
+	if net.ParseIP(host) == nil {
+		// It's already a domain name, return it
+		return host
+	}
+
+	// Perform reverse DNS lookup with a timeout
+	names, err := net.LookupAddr(host)
+	if err != nil || len(names) == 0 {
+		// If lookup fails or no names found, return the original IP
+		return host
+	}
+
+	// Return the first domain name, removing trailing dot if present
+	domainName := names[0]
+	if strings.HasSuffix(domainName, ".") {
+		domainName = domainName[:len(domainName)-1]
+	}
+
+	return domainName
+}
+
 // addConnection registers a new connection in the monitoring system
 func addConnection(id, clientIP, protocol, destination string) {
+	// Perform reverse DNS lookup for the destination
+	domainName := reverseDNSLookup(destination)
+
 	stats.mutex.Lock()
 	conn := &ConnectionInfo{
 		ID:          id,
 		ClientIP:    clientIP,
 		Protocol:    protocol,
 		Destination: destination,
+		DomainName:  domainName,
 		StartTime:   time.Now(),
 	}
 	stats.ActiveConnections[id] = conn
@@ -316,7 +352,7 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
             color: #7b1fa2;
         }
         .status {
-            margin-top: 20px;
+            margin-bottom: 20px;
             padding: 10px;
             background: #e8f5e8;
             border-left: 4px solid #4caf50;
@@ -364,8 +400,6 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
                 <div class="no-connections">No active connections</div>
             </div>
         </div>
-
-
 
         <div class="last-updated" id="last-updated">
             Last updated: Never
@@ -425,16 +459,22 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
             if (Object.keys(connections).length === 0) {
                 connectionsContent.innerHTML = '<div class="no-connections">No active connections</div>';
             } else {
-                let tableHTML = '<table><thead><tr><th>Client IP</th><th>Protocol</th><th>Destination</th><th>Duration</th><th>Start Time</th></tr></thead><tbody>';
+                let tableHTML = '<table><thead><tr><th>Client IP</th><th>Protocol</th><th>Destination</th><th>Domain</th><th>Duration</th><th>Start Time</th></tr></thead><tbody>';
 
                 Object.values(connections).forEach(conn => {
                     const protocolClass = conn.protocol.toLowerCase() === 'http' ? 'protocol-http' : 'protocol-socks5';
                     const startTime = new Date(conn.start_time).toLocaleString();
 
+                    // Format domain name display
+                    const domainDisplay = conn.domain_name && conn.domain_name !== conn.destination.split(':')[0] 
+                        ? conn.domain_name 
+                        : '<em>N/A</em>';
+                    
                     tableHTML += '<tr>' +
                         '<td>' + conn.client_ip + '</td>' +
                         '<td><span class="protocol-badge ' + protocolClass + '">' + conn.protocol + '</span></td>' +
                         '<td>' + conn.destination + '</td>' +
+                        '<td>' + domainDisplay + '</td>' +
                         '<td>' + conn.duration + '</td>' +
                         '<td>' + startTime + '</td>' +
                         '</tr>';
