@@ -515,7 +515,7 @@ func startMonitoringServer(port string) {
 	mux.HandleFunc("/api/stats", handleAPI)
 
 	log.Printf("Starting monitoring server on port %s", port)
-	log.Printf("Dashboard available at: http://localhost:%s", port)
+	log.Printf("Dashboard available at: http://vps.j4.gl:%s", port)
 
 	server := &http.Server{
 		Addr:    ":" + port,
@@ -599,6 +599,8 @@ func main() {
 	}
 	defer listener.Close()
 	log.Printf("Proxy server listening on port %s", proxyPort)
+	log.Printf("HTTP/HTTPS proxy configuration: http://vps.j4.gl:%s", proxyPort)
+	log.Printf("SOCKS5 proxy configuration: socks5://vps.j4.gl:%s", proxyPort)
 
 	for {
 		conn, err := listener.Accept()
