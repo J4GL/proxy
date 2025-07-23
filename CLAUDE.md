@@ -9,21 +9,24 @@ This is a Go-based multi-protocol proxy server that supports both HTTP/HTTPS and
 ## Key Architecture
 
 ### Protocol Detection
-- Uses protocol sniffing by peeking at the first byte of incoming connections
+- Uses protocol sniffing by peeking at the first byte of incoming connections (main.go:644-648)
 - SOCKS5 connections start with `0x05`, all others treated as HTTP
-- Single listener handles both protocols seamlessly
+- Single listener handles both protocols seamlessly using `bufio.NewReader.Peek(1)`
 
 ### Core Components
-- **main.go**: Contains the entire proxy server implementation
-- **config.yaml**: IP whitelist configuration
-- **test_server/**: Simple HTTP server for testing proxy functionality
-- **monitoring_test.go**: Go tests for monitoring functionality
+- **main.go**: Single-file implementation containing entire proxy server (800+ lines)
+- **config.yaml**: IP whitelist configuration loaded via `gopkg.in/yaml.v2`
+- **test_server/main.go**: Simple HTTP file server on port 8081 for testing
+- **monitoring_test.go**: Comprehensive Go tests for monitoring functionality
+- **test.sh**: Automated test suite handling server lifecycle and protocol testing
 
-### Monitoring System
-- Real-time WebSocket dashboard on port 8082 (configurable with `-monitor-port`)
-- REST API endpoint at `/api/stats` for connection statistics
-- HTML dashboard at root path with live connection tracking
-- Thread-safe connection tracking with unique IDs
+### Monitoring System Architecture
+- **Thread-Safe Statistics**: Uses `sync.RWMutex` for concurrent access to connection data
+- **WebSocket Broadcasting**: Dedicated goroutine with batching to prevent message flooding
+- **Real-Time Dashboard**: Embedded HTML/CSS/JavaScript served directly from Go strings
+- **REST API**: JSON endpoint at `/api/stats` for programmatic access
+- **Connection Tracking**: Unique IDs generated from nanosecond timestamps + connection count
+- **Reverse DNS**: Automatic domain name resolution for monitoring visibility
 
 ## Common Commands
 
@@ -51,7 +54,7 @@ cd test_server && ./test_server_app
 ### Testing
 ```bash
 # Run comprehensive test suite
-./test.sh
+[project_root]/test.sh
 
 # Run Go tests for monitoring
 go test -v -run TestMonitoring
@@ -75,20 +78,25 @@ curl --proxy socks5://localhost:8080 http://localhost:8081/test.txt
 
 ## Key Functions and Locations
 
-### Connection Handling
-- `handleConnection()` main.go:575 - Initial connection processing and IP validation
-- `handleHTTP()` main.go:620 - HTTP/HTTPS proxy logic
-- `handleSocks5()` main.go:673 - SOCKS5 proxy implementation
+### Connection Handling Flow
+- `handleConnection()` main.go:617 - Main connection entry point with IP validation and protocol routing
+- `handleHTTP()` main.go:662 - HTTP/HTTPS proxy logic with CONNECT method for HTTPS tunneling
+- `handleSocks5()` main.go:715 - Complete SOCKS5 implementation (IPv4/IPv6/domain support)
 
-### Monitoring System
-- `addConnection()` main.go:96 - Register new connections
-- `removeConnection()` main.go:118 - Clean up finished connections
-- `broadcastUpdate()` main.go:152 - Send updates to WebSocket clients
-- `handleWebSocket()` main.go:181 - WebSocket connection handler
+### Monitoring System Components
+- `addConnection()` main.go:128 - Register new connections with reverse DNS lookup
+- `removeConnection()` main.go:154 - Thread-safe cleanup of finished connections
+- `getStats()` main.go:168 - Thread-safe statistics retrieval with mutex locking
+- `broadcastUpdate()` main.go:188 - WebSocket update broadcasting with batching
+- `handleWebSocket()` main.go:217 - WebSocket connection lifecycle management
+- `handleAPI()` main.go:250 - REST API endpoint serving JSON statistics
+- `handleDashboard()` main.go:259 - Embedded HTML dashboard serving
 
-### Configuration
-- `loadConfig()` main.go:75 - Load and parse config.yaml
-- `isPortAvailable()` main.go:519 - Check port availability
+### Configuration and Utilities
+- `loadConfig()` main.go:76 - YAML configuration parsing with error handling
+- `reverseDNSLookup()` main.go:97 - Domain name resolution for monitoring visibility
+- `generateConnectionID()` main.go:554 - Unique ID generation using nanosecond timestamps
+- `isPortAvailable()` main.go:559 - TCP port availability checking
 
 ## Dependencies
 
@@ -98,18 +106,28 @@ curl --proxy socks5://localhost:8080 http://localhost:8081/test.txt
 
 ## Development Notes
 
-### Adding New Features
-- Connection tracking uses thread-safe maps with RWMutex
-- WebSocket updates are batched to prevent flooding
-- All monitoring data is JSON-serializable
+### Architecture Patterns
+- **Single-File Design**: Entire proxy server contained in main.go for simplicity
+- **Protocol Agnostic**: Single port handles multiple protocols through byte inspection
+- **Concurrent Safety**: All shared data protected by appropriate mutex types
+- **Embedded Resources**: HTML dashboard included as Go string literals (lines 262-506)
+- **Graceful Degradation**: Monitoring failures don't affect proxy functionality
+
+### Connection Lifecycle Management
+- Each connection gets unique ID from `generateConnectionID()` using nanosecond precision
+- Connections tracked in thread-safe map with automatic cleanup via defer statements
+- Reverse DNS lookup performed asynchronously to avoid blocking connection handling
+- WebSocket broadcasts batched with 100ms delay to prevent client flooding
 
 ### Testing Strategy
-- Use `test.sh` for comprehensive automated testing
-- Test server provides simple HTTP responses for validation
-- Both HTTP and SOCKS5 protocols should be tested
-- Monitor dashboard functionality with WebSocket connections
+- **Automated Suite**: `test.sh` handles complete server lifecycle (build, start, test, cleanup)
+- **Protocol Coverage**: Tests both HTTP and SOCKS5 protocols with curl/wget
+- **Monitoring Tests**: `monitoring_test.go` validates WebSocket functionality and API endpoints
+- **Manual Testing**: README provides curl commands for quick verification
+- **Error Simulation**: Test framework captures both stdout and stderr for debugging
 
-### Port Management
-- Check port availability before starting services
-- Proxy and monitoring servers run on separate ports
-- Test server runs independently on port 8081
+### Adding New Features
+- Monitor system uses `broadcastChan` (buffered channel) to signal updates without blocking
+- All statistics operations use `stats.mutex.RLock()/RUnlock()` for read access
+- WebSocket client management uses separate `wsMutex` to avoid deadlocks
+- New protocol support would require modification of protocol detection logic (main.go:644-648)

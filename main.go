@@ -459,23 +459,58 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
             if (Object.keys(connections).length === 0) {
                 connectionsContent.innerHTML = '<div class="no-connections">No active connections</div>';
             } else {
-                let tableHTML = '<table><thead><tr><th>Client IP</th><th>Protocol</th><th>Destination</th><th>Domain</th><th>Duration</th><th>Start Time</th></tr></thead><tbody>';
-
+                // Group connections by destination and domain
+                const grouped = {};
                 Object.values(connections).forEach(conn => {
-                    const protocolClass = conn.protocol.toLowerCase() === 'http' ? 'protocol-http' : 'protocol-socks5';
-                    const startTime = new Date(conn.start_time).toLocaleString();
-
-                    // Format domain name display
-                    const domainDisplay = conn.domain_name && conn.domain_name !== conn.destination.split(':')[0] 
+                    const domainName = conn.domain_name && conn.domain_name !== conn.destination.split(':')[0] 
                         ? conn.domain_name 
-                        : '<em>N/A</em>';
+                        : 'N/A';
+                    const key = conn.destination + '|' + domainName;
+                    
+                    if (!grouped[key]) {
+                        grouped[key] = {
+                            destination: conn.destination,
+                            domain: domainName,
+                            count: 0,
+                            protocols: new Set(),
+                            client_ips: new Set(),
+                            earliest_start: conn.start_time,
+                            latest_start: conn.start_time
+                        };
+                    }
+                    
+                    grouped[key].count++;
+                    grouped[key].protocols.add(conn.protocol);
+                    grouped[key].client_ips.add(conn.client_ip);
+                    
+                    if (conn.start_time < grouped[key].earliest_start) {
+                        grouped[key].earliest_start = conn.start_time;
+                    }
+                    if (conn.start_time > grouped[key].latest_start) {
+                        grouped[key].latest_start = conn.start_time;
+                    }
+                });
+                
+                let tableHTML = '<table><thead><tr><th>Client IPs</th><th>Protocol</th><th>Destination</th><th>Domain</th><th>Count</th><th>First Connection</th></tr></thead><tbody>';
+                
+                Object.values(grouped).forEach(group => {
+                    const protocolList = Array.from(group.protocols).map(p => {
+                        const protocolClass = p.toLowerCase() === 'http' ? 'protocol-http' : 'protocol-socks5';
+                        return '<span class="protocol-badge ' + protocolClass + '">' + p + '</span>';
+                    }).join(' ');
+                    
+                    const startTime = new Date(group.earliest_start).toLocaleString();
+                    const clientIpsList = Array.from(group.client_ips).join(', ');
+                    const domainDisplay = group.domain === 'N/A' ? '<em>N/A</em>' : group.domain;
+                    const destinationDisplay = group.destination;
+                    const domainDisplayWithCount = domainDisplay;
                     
                     tableHTML += '<tr>' +
-                        '<td>' + conn.client_ip + '</td>' +
-                        '<td><span class="protocol-badge ' + protocolClass + '">' + conn.protocol + '</span></td>' +
-                        '<td>' + conn.destination + '</td>' +
-                        '<td>' + domainDisplay + '</td>' +
-                        '<td>' + conn.duration + '</td>' +
+                        '<td>' + clientIpsList + '</td>' +
+                        '<td>' + protocolList + '</td>' +
+                        '<td>' + destinationDisplay + '</td>' +
+                        '<td>' + domainDisplayWithCount + '</td>' +
+                        '<td><strong>' + group.count + '</strong></td>' +
                         '<td>' + startTime + '</td>' +
                         '</tr>';
                 });
