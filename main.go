@@ -38,20 +38,33 @@ type Config struct {
 
 // ConnectionInfo holds information about an active connection
 type ConnectionInfo struct {
-	ID          string    `json:"id"`
-	ClientIP    string    `json:"client_ip"`
-	Protocol    string    `json:"protocol"`
-	Destination string    `json:"destination"`
-	DomainName  string    `json:"domain_name"`
-	StartTime   time.Time `json:"start_time"`
-	Duration    string    `json:"duration"`
+	ID            string    `json:"id"`
+	ClientIP      string    `json:"client_ip"`
+	Protocol      string    `json:"protocol"`
+	Destination   string    `json:"destination"`
+	DomainName    string    `json:"domain_name"`
+	StartTime     time.Time `json:"start_time"`
+	Duration      string    `json:"duration"`
+	BytesReceived int64     `json:"bytes_received"`
+	BytesSent     int64     `json:"bytes_sent"`
+	BandwidthIn   float64   `json:"bandwidth_in"`  // bytes per second (current window)
+	BandwidthOut  float64   `json:"bandwidth_out"` // bytes per second (current window)
+	// For time-windowed bandwidth calculation
+	LastUpdateTime  time.Time `json:"-"`
+	WindowBytesIn   int64     `json:"-"`
+	WindowBytesOut  int64     `json:"-"`
+	WindowStartTime time.Time `json:"-"`
 }
 
 // MonitoringStats holds overall statistics
 type MonitoringStats struct {
-	TotalConnections  int                        `json:"total_connections"`
-	ActiveConnections map[string]*ConnectionInfo `json:"active_connections"`
-	mutex             sync.RWMutex
+	TotalConnections    int                        `json:"total_connections"`
+	ActiveConnections   map[string]*ConnectionInfo `json:"active_connections"`
+	TotalBytesReceived  int64                      `json:"total_bytes_received"`
+	TotalBytesSent      int64                      `json:"total_bytes_sent"`
+	CurrentBandwidthIn  float64                    `json:"current_bandwidth_in"`  // bytes per second
+	CurrentBandwidthOut float64                    `json:"current_bandwidth_out"` // bytes per second
+	mutex               sync.RWMutex
 }
 
 // WebSocket upgrader
@@ -131,12 +144,20 @@ func addConnection(id, clientIP, protocol, destination string) {
 
 	stats.mutex.Lock()
 	conn := &ConnectionInfo{
-		ID:          id,
-		ClientIP:    clientIP,
-		Protocol:    protocol,
-		Destination: destination,
-		DomainName:  domainName,
-		StartTime:   time.Now(),
+		ID:              id,
+		ClientIP:        clientIP,
+		Protocol:        protocol,
+		Destination:     destination,
+		DomainName:      domainName,
+		StartTime:       time.Now(),
+		BytesReceived:   0,
+		BytesSent:       0,
+		BandwidthIn:     0,
+		BandwidthOut:    0,
+		WindowBytesIn:   0,
+		WindowBytesOut:  0,
+		WindowStartTime: time.Time{},
+		LastUpdateTime:  time.Time{},
 	}
 	stats.ActiveConnections[id] = conn
 	stats.TotalConnections++
@@ -164,23 +185,127 @@ func removeConnection(id string) {
 	}
 }
 
+// updateBandwidth updates bandwidth statistics for a connection using a time window
+func updateBandwidth(id string, bytesReceived, bytesSent int64) {
+	stats.mutex.Lock()
+	defer stats.mutex.Unlock()
+
+	if conn, exists := stats.ActiveConnections[id]; exists {
+		now := time.Now()
+
+		// Update total bytes
+		conn.BytesReceived += bytesReceived
+		conn.BytesSent += bytesSent
+		stats.TotalBytesReceived += bytesReceived
+		stats.TotalBytesSent += bytesSent
+
+		// Initialize window if this is the first update
+		if conn.WindowStartTime.IsZero() {
+			conn.WindowStartTime = now
+			conn.LastUpdateTime = now
+			conn.WindowBytesIn = 0
+			conn.WindowBytesOut = 0
+		}
+
+		// Add bytes to current window
+		conn.WindowBytesIn += bytesReceived
+		conn.WindowBytesOut += bytesSent
+		conn.LastUpdateTime = now
+
+		// Calculate bandwidth over the current window (minimum 1 second)
+		windowDuration := now.Sub(conn.WindowStartTime).Seconds()
+		if windowDuration >= 1.0 {
+			conn.BandwidthIn = float64(conn.WindowBytesIn) / windowDuration
+			conn.BandwidthOut = float64(conn.WindowBytesOut) / windowDuration
+
+			// Reset window
+			conn.WindowStartTime = now
+			conn.WindowBytesIn = 0
+			conn.WindowBytesOut = 0
+		} else if windowDuration > 0 {
+			// For very short windows, show instantaneous rate
+			conn.BandwidthIn = float64(conn.WindowBytesIn) / windowDuration
+			conn.BandwidthOut = float64(conn.WindowBytesOut) / windowDuration
+		}
+	}
+
+	// Signal broadcast update (non-blocking)
+	select {
+	case broadcastChan <- struct{}{}:
+	default:
+		// Channel is full, skip this update to prevent blocking
+	}
+}
+
+// copyWithTracking copies data between connections while tracking bandwidth
+func copyWithTracking(dst io.Writer, src io.Reader, connID string, isOutbound bool) (written int64, err error) {
+	buffer := make([]byte, 32*1024) // 32KB buffer
+	for {
+		nr, er := src.Read(buffer)
+		if nr > 0 {
+			nw, ew := dst.Write(buffer[0:nr])
+			if nw > 0 {
+				written += int64(nw)
+				// Update bandwidth tracking
+				if isOutbound {
+					updateBandwidth(connID, 0, int64(nw))
+				} else {
+					updateBandwidth(connID, int64(nw), 0)
+				}
+			}
+			if ew != nil {
+				err = ew
+				break
+			}
+			if nr != nw {
+				err = io.ErrShortWrite
+				break
+			}
+		}
+		if er != nil {
+			if er != io.EOF {
+				err = er
+			}
+			break
+		}
+	}
+	return written, err
+}
+
 // getStats returns current statistics (thread-safe)
 func getStats() MonitoringStats {
 	stats.mutex.RLock()
 	defer stats.mutex.RUnlock()
 
-	// Update durations for active connections
+	now := time.Now()
 	result := MonitoringStats{
-		TotalConnections:  stats.TotalConnections,
-		ActiveConnections: make(map[string]*ConnectionInfo),
+		TotalConnections:   stats.TotalConnections,
+		ActiveConnections:  make(map[string]*ConnectionInfo),
+		TotalBytesReceived: stats.TotalBytesReceived,
+		TotalBytesSent:     stats.TotalBytesSent,
 	}
 
+	var totalBandwidthIn, totalBandwidthOut float64
 	for id, conn := range stats.ActiveConnections {
 		connCopy := *conn
 		connCopy.Duration = time.Since(conn.StartTime).Round(time.Second).String()
+
+		// Check if connection has been idle for more than 2 seconds
+		if !conn.LastUpdateTime.IsZero() && now.Sub(conn.LastUpdateTime) > 2*time.Second {
+			// Connection is idle, bandwidth should be 0
+			connCopy.BandwidthIn = 0
+			connCopy.BandwidthOut = 0
+		}
+
 		result.ActiveConnections[id] = &connCopy
+
+		// Only accumulate bandwidth for non-idle connections
+		totalBandwidthIn += connCopy.BandwidthIn
+		totalBandwidthOut += connCopy.BandwidthOut
 	}
 
+	result.CurrentBandwidthIn = totalBandwidthIn
+	result.CurrentBandwidthOut = totalBandwidthOut
 	return result
 }
 
@@ -258,287 +383,7 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 // handleDashboard serves the monitoring dashboard HTML
 func handleDashboard(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
-
-	html := `<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Proxy Server Monitor</title>
-    <style>
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            margin: 0;
-            padding: 20px;
-            background-color: #f5f5f5;
-        }
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-        }
-        .header {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 20px;
-            border-radius: 10px;
-            margin-bottom: 20px;
-            text-align: center;
-        }
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 20px;
-            margin-bottom: 30px;
-        }
-        .stat-card {
-            background: white;
-            padding: 20px;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-            text-align: center;
-        }
-        .stat-number {
-            font-size: 2.5em;
-            font-weight: bold;
-            color: #667eea;
-            margin-bottom: 10px;
-        }
-        .stat-label {
-            color: #666;
-            font-size: 1.1em;
-        }
-        .connections-table {
-            background: white;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-            overflow: hidden;
-        }
-        .table-header {
-            background: #667eea;
-            color: white;
-            padding: 15px 20px;
-            font-size: 1.2em;
-            font-weight: bold;
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-        }
-        th, td {
-            padding: 12px 15px;
-            text-align: left;
-            border-bottom: 1px solid #eee;
-        }
-        th {
-            background-color: #f8f9fa;
-            font-weight: 600;
-            color: #333;
-        }
-        tr:hover {
-            background-color: #f8f9fa;
-        }
-        .protocol-badge {
-            padding: 4px 8px;
-            border-radius: 4px;
-            font-size: 0.8em;
-            font-weight: bold;
-        }
-        .protocol-http {
-            background-color: #e3f2fd;
-            color: #1976d2;
-        }
-        .protocol-socks5 {
-            background-color: #f3e5f5;
-            color: #7b1fa2;
-        }
-        .status {
-            margin-bottom: 20px;
-            padding: 10px;
-            background: #e8f5e8;
-            border-left: 4px solid #4caf50;
-            border-radius: 4px;
-        }
-        .no-connections {
-            text-align: center;
-            padding: 40px;
-            color: #666;
-            font-style: italic;
-        }
-        .last-updated {
-            text-align: center;
-            margin-top: 20px;
-            color: #666;
-            font-size: 0.9em;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>🔍 Proxy Server Monitor</h1>
-            <p>Real-time monitoring dashboard for proxy connections</p>
-        </div>
-
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-number" id="total-connections">0</div>
-                <div class="stat-label">Total Connections</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-number" id="active-connections">0</div>
-                <div class="stat-label">Active Connections</div>
-            </div>
-        </div>
-
-        <div class="status" id="connection-status">
-            🟢 Connected to monitoring server
-        </div>
-
-        <div class="connections-table">
-            <div class="table-header">Active Connections</div>
-            <div id="connections-content">
-                <div class="no-connections">No active connections</div>
-            </div>
-        </div>
-
-        <div class="last-updated" id="last-updated">
-            Last updated: Never
-        </div>
-    </div>
-
-    <script>
-        let ws;
-        let reconnectInterval;
-
-        function connectWebSocket() {
-            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const wsUrl = protocol + '//' + window.location.host + '/ws';
-
-            ws = new WebSocket(wsUrl);
-
-            ws.onopen = function() {
-                console.log('WebSocket connected');
-                document.getElementById('connection-status').innerHTML = '🟢 Connected to monitoring server';
-                document.getElementById('connection-status').style.background = '#e8f5e8';
-                document.getElementById('connection-status').style.borderColor = '#4caf50';
-                if (reconnectInterval) {
-                    clearInterval(reconnectInterval);
-                    reconnectInterval = null;
-                }
-            };
-
-            ws.onmessage = function(event) {
-                const data = JSON.parse(event.data);
-                updateDashboard(data);
-            };
-
-            ws.onclose = function() {
-                console.log('WebSocket disconnected');
-                document.getElementById('connection-status').innerHTML = '🔴 Disconnected from monitoring server';
-                document.getElementById('connection-status').style.background = '#ffebee';
-                document.getElementById('connection-status').style.borderColor = '#f44336';
-
-                // Attempt to reconnect every 5 seconds
-                if (!reconnectInterval) {
-                    reconnectInterval = setInterval(connectWebSocket, 5000);
-                }
-            };
-
-            ws.onerror = function(error) {
-                console.error('WebSocket error:', error);
-            };
-        }
-
-        function updateDashboard(data) {
-            document.getElementById('total-connections').textContent = data.total_connections || 0;
-            document.getElementById('active-connections').textContent = Object.keys(data.active_connections || {}).length;
-
-            const connectionsContent = document.getElementById('connections-content');
-            const connections = data.active_connections || {};
-
-            if (Object.keys(connections).length === 0) {
-                connectionsContent.innerHTML = '<div class="no-connections">No active connections</div>';
-            } else {
-                // Group connections by destination and domain
-                const grouped = {};
-                Object.values(connections).forEach(conn => {
-                    const domainName = conn.domain_name && conn.domain_name !== conn.destination.split(':')[0] 
-                        ? conn.domain_name 
-                        : 'N/A';
-                    const key = conn.destination + '|' + domainName;
-                    
-                    if (!grouped[key]) {
-                        grouped[key] = {
-                            destination: conn.destination,
-                            domain: domainName,
-                            count: 0,
-                            protocols: new Set(),
-                            client_ips: new Set(),
-                            earliest_start: conn.start_time,
-                            latest_start: conn.start_time
-                        };
-                    }
-                    
-                    grouped[key].count++;
-                    grouped[key].protocols.add(conn.protocol);
-                    grouped[key].client_ips.add(conn.client_ip);
-                    
-                    if (conn.start_time < grouped[key].earliest_start) {
-                        grouped[key].earliest_start = conn.start_time;
-                    }
-                    if (conn.start_time > grouped[key].latest_start) {
-                        grouped[key].latest_start = conn.start_time;
-                    }
-                });
-                
-                let tableHTML = '<table><thead><tr><th>Client IPs</th><th>Protocol</th><th>Destination</th><th>Domain</th><th>Count</th><th>First Connection</th></tr></thead><tbody>';
-                
-                Object.values(grouped).forEach(group => {
-                    const protocolList = Array.from(group.protocols).map(p => {
-                        const protocolClass = p.toLowerCase() === 'http' ? 'protocol-http' : 'protocol-socks5';
-                        return '<span class="protocol-badge ' + protocolClass + '">' + p + '</span>';
-                    }).join(' ');
-                    
-                    const startTime = new Date(group.earliest_start).toLocaleString();
-                    const clientIpsList = Array.from(group.client_ips).join(', ');
-                    const domainDisplay = group.domain === 'N/A' ? '<em>N/A</em>' : group.domain;
-                    const destinationDisplay = group.destination;
-                    const domainDisplayWithCount = domainDisplay;
-                    
-                    tableHTML += '<tr>' +
-                        '<td>' + clientIpsList + '</td>' +
-                        '<td>' + protocolList + '</td>' +
-                        '<td>' + destinationDisplay + '</td>' +
-                        '<td>' + domainDisplayWithCount + '</td>' +
-                        '<td><strong>' + group.count + '</strong></td>' +
-                        '<td>' + startTime + '</td>' +
-                        '</tr>';
-                });
-
-                tableHTML += '</tbody></table>';
-                connectionsContent.innerHTML = tableHTML;
-            }
-
-            document.getElementById('last-updated').textContent = 'Last updated: ' + new Date().toLocaleString();
-        }
-
-        // Initialize WebSocket connection
-        connectWebSocket();
-
-        // Fallback: fetch data every 30 seconds if WebSocket fails
-        setInterval(function() {
-            if (ws.readyState !== WebSocket.OPEN) {
-                fetch('/api/stats')
-                    .then(response => response.json())
-                    .then(data => updateDashboard(data))
-                    .catch(error => console.error('Error fetching data:', error));
-            }
-        }, 30000);
-    </script>
-</body>
-</html>`
-
-	fmt.Fprint(w, html)
+	http.ServeFile(w, r, "dashboard.html")
 }
 
 // startMonitoringServer starts the web monitoring server
@@ -548,6 +393,10 @@ func startMonitoringServer(port string) {
 	mux.HandleFunc("/", handleDashboard)
 	mux.HandleFunc("/ws", handleWebSocket)
 	mux.HandleFunc("/api/stats", handleAPI)
+	
+	// Serve static files (CSS and JS)
+	fs := http.FileServer(http.Dir("static/"))
+	mux.Handle("/static/", http.StripPrefix("/static/", fs))
 
 	log.Printf("Starting monitoring server on port %s", port)
 	log.Printf("Dashboard available at: http://vps.j4.gl:%s", port)
@@ -566,19 +415,31 @@ func startMonitoringServer(port string) {
 // startBroadcastWorker starts a goroutine that handles WebSocket broadcasts sequentially
 func startBroadcastWorker() {
 	go func() {
-		for range broadcastChan {
-			broadcastUpdate()
-			// Add a small delay to batch rapid updates
-			time.Sleep(100 * time.Millisecond)
+		lastBroadcast := time.Time{}
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
 
-			// Drain any additional signals that came in during the delay
-		drainLoop:
-			for {
-				select {
-				case <-broadcastChan:
-					// Drain additional signals
-				default:
-					break drainLoop
+		pendingUpdate := false
+
+		for {
+			select {
+			case <-broadcastChan:
+				// Mark that we have a pending update
+				pendingUpdate = true
+
+				// If enough time has passed since last broadcast, send immediately
+				if time.Since(lastBroadcast) >= 1*time.Second {
+					broadcastUpdate()
+					lastBroadcast = time.Now()
+					pendingUpdate = false
+				}
+
+			case <-ticker.C:
+				// Send update if we have pending changes
+				if pendingUpdate {
+					broadcastUpdate()
+					lastBroadcast = time.Now()
+					pendingUpdate = false
 				}
 			}
 		}
@@ -743,8 +604,10 @@ func handleHTTP(clientConn net.Conn, reader *bufio.Reader, debug bool, connID, c
 	if debug {
 		log.Printf("Relaying data between client and %s", address)
 	}
-	go io.Copy(serverConn, clientConn)
-	io.Copy(clientConn, serverConn)
+
+	// Use tracking copies for bandwidth monitoring
+	go copyWithTracking(serverConn, clientConn, connID, true) // Client to server (outbound)
+	copyWithTracking(clientConn, serverConn, connID, false)   // Server to client (inbound)
 }
 
 func handleSocks5(clientConn net.Conn, reader *bufio.Reader, debug bool, connID, clientIP string) {
@@ -864,6 +727,8 @@ func handleSocks5(clientConn net.Conn, reader *bufio.Reader, debug bool, connID,
 	if debug {
 		log.Printf("SOCKS5: Relaying data for %s", address)
 	}
-	go io.Copy(destConn, reader)
-	io.Copy(clientConn, destConn)
+
+	// Use tracking copies for bandwidth monitoring
+	go copyWithTracking(destConn, reader, connID, true)   // Client to server (outbound)
+	copyWithTracking(clientConn, destConn, connID, false) // Server to client (inbound)
 }

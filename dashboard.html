@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Proxy Server Monitor</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="/static/dashboard.css">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🔍 Proxy Server Monitor</h1>
+            <p>Real-time monitoring dashboard for proxy connections</p>
+        </div>
+
+        <div class="stats-grid">
+            <div class="connection-card">
+                <div class="connection-number" id="total-connections">0</div>
+                <div class="connection-label">Total</div>
+            </div>
+            <div class="connection-card">
+                <div class="connection-number" id="active-connections">0</div>
+                <div class="connection-label">Active</div>
+            </div>
+            <div class="speed-card">
+                <div class="speed-number" id="bandwidth-in">0 KB/s</div>
+                <div class="speed-label">Download Speed</div>
+            </div>
+            <div class="speed-card">
+                <div class="speed-number" id="bandwidth-out">0 KB/s</div>
+                <div class="speed-label">Upload Speed</div>
+            </div>
+        </div>
+
+        <div class="status" id="connection-status">
+            🟢 Connected to monitoring server
+        </div>
+
+        <div class="chart-container">
+            <div class="chart-header">📊 Real-time Bandwidth Usage</div>
+            <div class="chart-content">
+                <canvas id="bandwidth-chart"></canvas>
+            </div>
+        </div>
+
+        <div class="connections-table">
+            <div class="table-header">Active Connections</div>
+            <div id="connections-content">
+                <div class="no-connections">No active connections</div>
+            </div>
+        </div>
+
+        <div class="last-updated" id="last-updated">
+            Last updated: Never
+        </div>
+    </div>
+
+    <script src="/static/dashboard.js"></script>
+</body>
+</html>
